@@ -259,6 +259,9 @@ function endRender() {
   for (const key of [...hookStore.keys()]) {
     if (!hookLive.has(key)) hookStore.delete(key)
   }
+  for (const key of [...refStore.keys()]) {
+    if (!hookLive.has(key)) refStore.delete(key)
+  }
 }
 
 function useHookSlot(initial) {
@@ -271,6 +274,22 @@ function useHookSlot(initial) {
   }]
 }
 
+/**
+ * `useRef` backing store.
+ *
+ * The panel keeps its sheet element and in-flight drag state in refs, so the
+ * shim has to provide a stable mutable box per component instance. It is keyed
+ * the same way as hook state so a remount yields a fresh ref, as React does.
+ */
+let refStore = new Map()
+function useRefSlot(initial) {
+  const key = hookPath.join('\u0000') + '#ref' + hookCursor
+  hookCursor += 1
+  hookLive.add(key)
+  if (!refStore.has(key)) refStore.set(key, { current: initial })
+  return refStore.get(key)
+}
+
 const react = {
   createElement(type, props, ...children) {
     return { node: true, type, props: props === null || props === undefined ? {} : props, children: children.flat(Infinity).filter(c => c !== null && c !== undefined && c !== false) }
@@ -280,6 +299,7 @@ const react = {
   },
   useEffect() {},
   useState: useHookSlot,
+  useRef: useRefSlot,
 }
 
 /** Stable identity of one component instance during a traversal. */
@@ -310,6 +330,17 @@ const documentShim = {
   querySelector: () => null,
 }
 
+/**
+ * Viewport size the shim reports.
+ *
+ * The drag clamp reads `window.innerWidth/innerHeight`, so these have to be real
+ * numbers for the off-screen test to mean anything.
+ */
+const VIEWPORT = { width: 1280, height: 840 }
+
+/** Listeners registered on `window`, so a test can dispatch a drag. */
+const windowListeners = new Map()
+
 const windowShim = {
   localStorage: {
     getItem: key => (storage.has(key) ? storage.get(key) : null),
@@ -319,6 +350,20 @@ const windowShim = {
   confirm: () => true,
   speechSynthesis: undefined,
   SpeechSynthesisUtterance: undefined,
+  get innerWidth() { return VIEWPORT.width },
+  get innerHeight() { return VIEWPORT.height },
+  addEventListener(type, listener) {
+    if (!windowListeners.has(type)) windowListeners.set(type, new Set())
+    windowListeners.get(type).add(listener)
+  },
+  removeEventListener(type, listener) {
+    windowListeners.get(type)?.delete(listener)
+  },
+}
+
+/** Dispatch one window-level event to every registered listener. */
+function dispatchWindow(type, event) {
+  for (const listener of [...(windowListeners.get(type) ?? [])]) listener(event)
 }
 
 let factory = null
@@ -378,9 +423,67 @@ check('every seat has an id', registered.every(entry => typeof entry.spec.id ===
 check('every seat has a component', registered.every(entry => typeof entry.component === 'function'))
 check('styles were injected', documentShim.head.children.length === 1)
 const injectedCss = documentShim.head.children[0].textContent
-// The shell's overlay layer is click-through; the panel must opt back in.
-check('overlay surface opts into pointer events', /\.el-overlay\{[^}]*pointer-events:auto/.test(injectedCss), injectedCss.slice(0, 120))
-check('stylesheet namespaces every rule', injectedCss.split('\n').every(line => line.startsWith('.el-')))
+// The panel is non-modal: the overlay layer stays click-through so the chat
+// underneath keeps receiving clicks, and only the sheet opts back in.
+check('overlay backdrop does not capture clicks', /\.el-overlay\{[^}]*pointer-events:none/.test(injectedCss), 'backdrop still captures pointer events')
+check('overlay backdrop paints no dimming layer', !/\.el-overlay\{[^}]*background:(?!transparent)[^;}]*;/.test(injectedCss), 'backdrop still dims the app')
+check('sheet opts back into pointer events', /\.el-sheet\{[^}]*pointer-events:auto/.test(injectedCss), 'sheet does not capture its own clicks')
+// Opacity fades surfaces, never text. A blanket `opacity` on the sheet would
+// also fade every word and button, which is the one thing this must not do.
+check('opacity fades surfaces through a variable', /background:color-mix\(in srgb,var\(--dsw-alias-bg-[a-z0-9-]+\) calc\(var\(--el-alpha\) \* 100%\),transparent\)/.test(injectedCss), 'surfaces do not use the alpha variable')
+check('no rule fades the whole sheet with opacity', !/\.el-sheet\{[^}]*[^-]opacity:/.test(injectedCss), 'the sheet itself is faded, text included')
+check('text colours never carry the alpha variable', !/color:color-mix\([^}]*--el-alpha/.test(injectedCss), 'a text colour is being faded')
+// Every rule must stay inside the plugin's own namespace so it cannot restyle
+// the shell. `@media` wrappers are allowed; their contents are checked above.
+check('stylesheet namespaces every rule',
+  injectedCss.split('\n').every(line => line.startsWith('.el-') || line.startsWith('@media') || line.trim() === ''))
+
+// Panel geometry: the sheet must stay clearly smaller than the viewport, and
+// must adapt on narrow windows rather than overflow.
+const sheetWidth = Number(/--el-sheet-w:(\d+)px/.exec(injectedCss)?.[1])
+const sheetHeight = Number(/--el-sheet-h:(\d+)px/.exec(injectedCss)?.[1])
+check('sheet width is defined', Number.isFinite(sheetWidth) && sheetWidth > 0, String(sheetWidth))
+check('sheet height is defined', Number.isFinite(sheetHeight) && sheetHeight > 0, String(sheetHeight))
+// A concrete ceiling, not just "smaller than the viewport": the panel is a study
+// card, and an earlier revision declared 860x660 here while the rule that used
+// it was silently dead, so the sheet rendered at whatever the content wanted.
+check('sheet is a compact card, not an app window', sheetWidth <= 760 && sheetHeight <= 560, `${sheetWidth}x${sheetHeight}`)
+check('sheet leaves room for the surrounding UI', sheetWidth >= 600 && sheetHeight >= 420, `${sheetWidth}x${sheetHeight}`)
+check('sheet fits the test viewport without shrinking', sheetWidth + 2 * 8 <= VIEWPORT.width && sheetHeight + 2 * 8 <= VIEWPORT.height, `${sheetWidth}x${sheetHeight} in ${VIEWPORT.width}x${VIEWPORT.height}`)
+check('sheet has a max-vw guard', /\.el-sheet\{[^}]*min\(var\(--el-sheet-w\),100vw - 2\*var\(--el-gap\)\)/.test(injectedCss), 'no vw guard')
+check('sheet has a max-vh guard', /\.el-sheet\{[^}]*min\(var\(--el-sheet-h\),100vh - 2\*var\(--el-gap\)\)/.test(injectedCss), 'no vh guard')
+// The geometry variables must be declared on an ancestor of `.el-sheet`. They
+// used to live only on `.el-root`, which sits *inside* the sheet — custom
+// properties do not inherit upwards, so the whole width rule silently died.
+const geometryOwner = /([^{}]+)\{[^{}]*--el-sheet-w:/.exec(injectedCss)?.[1] ?? ''
+check('sheet geometry is declared where the sheet can read it',
+  /\.el-overlay/.test(geometryOwner), `declared on "${geometryOwner.trim()}"`)
+const sheetGap = Number(/--el-gap:(\d+)px/.exec(injectedCss)?.[1])
+check('sheet edge gap is defined', Number.isFinite(sheetGap) && sheetGap > 0, String(sheetGap))
+check('overlay padding matches the sheet gap', /\.el-overlay\{[^}]*padding:var\(--el-gap\)/.test(injectedCss), 'overlay padding differs from the gap')
+
+// Scrolling. `.el-sheet` is a fixed-height flex column with `overflow:hidden`,
+// so the body can only scroll if EVERY link in the chain below it can shrink:
+// the sheet's child wrapper must be a flex column with `min-height:0`, and the
+// body must be a `min-height:0` flex child with `overflow-y:auto`. A single
+// missing `min-height:0` makes the body grow past the sheet and get clipped,
+// which is exactly the "content below is unreachable" bug this guards.
+check('sheet clips its own overflow', /\.el-sheet\{[^}]*overflow:hidden/.test(injectedCss), 'sheet does not clip')
+check('overlay content wrapper fills the sheet',
+  /\.el-fill\{[^}]*flex:1[^}]*min-height:0[^}]*\}/.test(injectedCss), 'no filling flex wrapper')
+check('overlay content wrapper is a flex column',
+  /\.el-fill\{[^}]*display:flex[^}]*flex-direction:column/.test(injectedCss), 'wrapper is not a flex column')
+check('body scrolls vertically',
+  /\.el-body\{[^}]*overflow-y:auto/.test(injectedCss), 'body does not scroll')
+check('body can shrink inside the flex column',
+  /\.el-body\{[^}]*min-height:0/.test(injectedCss), 'body cannot shrink, so it will be clipped')
+check('body scroll does not chain to the page',
+  /\.el-body\{[^}]*overscroll-behavior:contain/.test(injectedCss), 'scroll chains to the app behind')
+check('scrollbar is visible', /\.el-body::-webkit-scrollbar\{[^}]*width:\d+px/.test(injectedCss), 'no visible scrollbar')
+check('narrow-window breakpoint exists', /@media \(max-width:980px\)/.test(injectedCss))
+check('very-narrow breakpoint exists', /@media \(max-width:640px\)/.test(injectedCss))
+check('very-narrow breakpoint stacks the grades',
+  /@media \(max-width:640px\)\{[^@]*\.el-grades\{grid-template-columns:repeat\(2,1fr\)/.test(injectedCss))
 check('effects were registered', effects.length >= 2)
 
 /** Render a component tree to a flat list of text, invoking function components. */
@@ -506,6 +609,153 @@ check('toggle opens the overlay', fire(react.createElement(Toggle, { wide: true 
 
 let tree = react.createElement(Overlay, {})
 check('overlay visible after toggle', render(tree).length > 0)
+
+// The overlay's content wrapper must actually carry the fill class; the CSS
+// alone is useless if the element never gets the class.
+const overlayRoot = elementsOf(tree).find(element => hasClass(element, 'el-root'))
+check('overlay content wrapper uses the fill class', hasClass(overlayRoot ?? { props: {} }, 'el-fill'),
+  String(overlayRoot?.props?.className))
+const overlayBody = elementsOf(tree).find(element => hasClass(element, 'el-body'))
+check('overlay body is present', overlayBody !== undefined)
+
+// --- Non-modal: the panel must not close on an outside click --------------
+// The panel shares the screen with the chat, so a click beside it belongs to
+// the app underneath and must never dismiss it. The overlay element carries no
+// click handler at all, which is what makes the backdrop click-through.
+const overlayElement = elementsOf(tree).find(element => hasClass(element, 'el-overlay'))
+check('overlay element exists', overlayElement !== undefined)
+check('backdrop has no click handler', overlayElement?.props.onClick === undefined)
+check('panel declares itself non-modal', overlayElement?.props['aria-modal'] === 'false', String(overlayElement?.props['aria-modal']))
+// Simulate the outside click the old modal used to close on. Even if a handler
+// were reintroduced, this must leave the panel open.
+if (typeof overlayElement?.props.onClick === 'function') {
+  const fakeOverlay = { currentTarget: 'overlay', target: 'overlay' }
+  overlayElement.props.onClick(fakeOverlay)
+}
+tree = react.createElement(Overlay, {})
+check('panel stays open after a click outside it', render(tree).length > 0)
+// The header close button is still the explicit way out.
+const headerClose = elementsOf(tree).find(element => hasClass(element, 'el-iconbtn'))
+check('header close button still exists', headerClose !== undefined)
+headerClose.props.onClick()
+eq('header close button dismisses the panel', render(react.createElement(Overlay, {})).length, 0)
+// Reopen for the rest of the suite.
+fire(react.createElement(Toggle, { wide: true }), 'el-root', 'onClick')
+tree = react.createElement(Overlay, {})
+
+// --- Dragging the panel ----------------------------------------------------
+// The header is the drag handle. A drag moves the sheet by the pointer delta,
+// is clamped so the panel cannot leave the viewport, persists on release, and
+// resets on a double-click.
+const sheetElement = elementsOf(tree).find(element => hasClass(element, 'el-sheet'))
+check('sheet element exists', sheetElement !== undefined)
+check('sheet starts centred', sheetElement?.props.style?.transform === 'translate(0px, 0px)', sheetElement?.props.style?.transform)
+
+const headElement = elementsOf(tree).find(element => hasClass(element, 'el-head'))
+check('header is the drag handle', headElement !== undefined && typeof headElement.props.onPointerDown === 'function')
+
+/** Simulate a full pointer drag from the header. */
+function dragBy(dx, dy) {
+  const start = { clientX: 500, clientY: 300, button: 0, target: { tagName: 'DIV', parentNode: null }, currentTarget: null }
+  start.target.parentNode = start.currentTarget
+  headElement.props.onPointerDown(start)
+  dispatchWindow('pointermove', { clientX: 500 + dx, clientY: 300 + dy })
+  dispatchWindow('pointerup', {})
+  return react.createElement(Overlay, {})
+}
+
+// A real drag moves the sheet by the pointer delta, up to the clamp.
+// The shim reports no layout, so the sheet falls back to its declared default
+// size. Both the expected offsets and the edge checks below are derived from
+// that size rather than hard-coded, so resizing the panel cannot leave a stale
+// number behind in the tests.
+const EXPECTED_X = 120
+const EXPECTED_Y = 60
+tree = dragBy(120, 60)
+const movedSheet = elementsOf(tree).find(element => hasClass(element, 'el-sheet'))
+check('drag moves the sheet horizontally', movedSheet?.props.style?.transform === `translate(${EXPECTED_X}px, ${EXPECTED_Y}px)`, movedSheet?.props.style?.transform)
+check('drag offset persisted', (() => {
+  const saved = JSON.parse(storage.get(core.STORAGE_KEY)).ui.panelOffset
+  return saved.x === EXPECTED_X && saved.y === EXPECTED_Y
+})(), JSON.stringify(JSON.parse(storage.get(core.STORAGE_KEY)).ui.panelOffset))
+
+// A drag far past the edge is clamped, leaving the whole panel reachable.
+tree = dragBy(5000, 5000)
+const clampedSheet = elementsOf(tree).find(element => hasClass(element, 'el-sheet'))
+const clampMatch = /translate\((-?[\d.]+)px, (-?[\d.]+)px\)/.exec(clampedSheet?.props.style?.transform ?? '')
+check('huge drag is clamped, not applied literally', clampMatch !== null && Number(clampMatch[1]) < 5000, clampedSheet?.props.style?.transform)
+check('clamped offset stays inside the drag range', clampMatch !== null
+  && Math.abs(Number(clampMatch[1])) <= (VIEWPORT.width - sheetWidth) / 2
+  && Math.abs(Number(clampMatch[2])) <= (VIEWPORT.height - sheetHeight) / 2, clampedSheet?.props.style?.transform)
+
+/**
+ * Every edge of the sheet at `offset` must land inside the viewport.
+ *
+ * This is the assertion that actually pins down "no side may hang off-screen":
+ * it checks all four edges, not just the offset's magnitude.
+ */
+function edgesInsideViewport(offset, width, height) {
+  const left = (VIEWPORT.width - width) / 2 + offset.x
+  const top = (VIEWPORT.height - height) / 2 + offset.y
+  return left >= 0 && top >= 0 && left + width <= VIEWPORT.width && top + height <= VIEWPORT.height
+}
+
+check('clamped panel keeps all four edges on screen',
+  clampMatch !== null && edgesInsideViewport({ x: Number(clampMatch[1]), y: Number(clampMatch[2]) }, sheetWidth, sheetHeight),
+  clampedSheet?.props.style?.transform)
+// ...and each edge still keeps the configured margin, not merely a pixel of it.
+check('clamped panel keeps the edge gap', clampMatch !== null
+  && (VIEWPORT.height - sheetHeight) / 2 + Number(clampMatch[2]) >= sheetGap - 0.5
+  && (VIEWPORT.height + sheetHeight) / 2 + Number(clampMatch[2]) <= VIEWPORT.height - sheetGap + 0.5,
+  clampedSheet?.props.style?.transform)
+
+// Dragging far to the other side must also stay inside, so the clamp is not
+// one-sided.
+tree = dragBy(-5000, -5000)
+const oppositeSheet = elementsOf(tree).find(element => hasClass(element, 'el-sheet'))
+const oppositeMatch = /translate\((-?[\d.]+)px, (-?[\d.]+)px\)/.exec(oppositeSheet?.props.style?.transform ?? '')
+check('clamped panel stays on screen when dragged the other way',
+  oppositeMatch !== null && edgesInsideViewport({ x: Number(oppositeMatch[1]), y: Number(oppositeMatch[2]) }, sheetWidth, sheetHeight),
+  oppositeSheet?.props.style?.transform)
+
+// On a window too small for the sheet the clamp collapses to zero: the panel
+// cannot be pushed out of a viewport it already fills.
+{
+  const saved = { width: VIEWPORT.width, height: VIEWPORT.height }
+  VIEWPORT.width = 500
+  VIEWPORT.height = 400
+  tree = dragBy(300, 300)
+  const tinySheet = elementsOf(tree).find(element => hasClass(element, 'el-sheet'))
+  check('panel cannot be dragged off a viewport it already fills',
+    tinySheet?.props.style?.transform === 'translate(0px, 0px)', tinySheet?.props.style?.transform)
+  VIEWPORT.width = saved.width
+  VIEWPORT.height = saved.height
+}
+
+// Double-clicking the header re-centres.
+headElement.props.onDoubleClick()
+tree = react.createElement(Overlay, {})
+const recentred = elementsOf(tree).find(element => hasClass(element, 'el-sheet'))
+check('double-click re-centres the panel', recentred?.props.style?.transform === 'translate(0px, 0px)', recentred?.props.style?.transform)
+
+// A drag that starts on a header control must not move the panel.
+const closeButton = elementsOf(tree).find(element => hasClass(element, 'el-iconbtn'))
+const beforeControlDrag = elementsOf(tree).find(element => hasClass(element, 'el-sheet'))?.props.style?.transform
+const buttonTarget = { tagName: 'BUTTON', parentNode: null }
+buttonTarget.parentNode = { tagName: 'DIV', parentNode: null }
+headElement.props.onPointerDown({ clientX: 500, clientY: 300, button: 0, target: buttonTarget, currentTarget: { tagName: 'DIV' } })
+dispatchWindow('pointermove', { clientX: 900, clientY: 700 })
+dispatchWindow('pointerup', {})
+tree = react.createElement(Overlay, {})
+check('dragging from a header button does nothing',
+  elementsOf(tree).find(element => hasClass(element, 'el-sheet'))?.props.style?.transform === beforeControlDrag)
+
+// A right-click must not start a drag either.
+headElement.props.onPointerDown({ clientX: 500, clientY: 300, button: 2, target: { tagName: 'DIV', parentNode: null }, currentTarget: { tagName: 'DIV' } })
+dispatchWindow('pointermove', { clientX: 900, clientY: 700 })
+dispatchWindow('pointerup', {})
+tree = react.createElement(Overlay, {})
+check('right-click does not drag', elementsOf(tree).find(element => hasClass(element, 'el-sheet'))?.props.style?.transform === 'translate(0px, 0px)')
 
 // --- Learn tab: start a 20-word set, see a card, grade it ------------------
 // The deck is one sequence, so the surface offers a set to start rather than a
@@ -654,12 +904,50 @@ const hideToggle = elementsOf(tree).find(element =>
   element.type === 'input' && element.props.type === 'checkbox' && element.props.checked === false)
 check('preference checkboxes are present', hideToggle !== undefined)
 const settingsRows = elementsOf(tree).filter(element => hasClass(element, 'el-field'))
-eq('four preference rows', settingsRows.length, 4)
-// Flip the "hide the meaning first" row (the last one) on.
+eq('five preference rows', settingsRows.length, 5)
+// Flip the "hide the meaning first" row (fourth) on.
 const hideCheckbox = elementsOf(settingsRows[3]).find(element => element.type === 'input')
 hideCheckbox.props.onChange({ target: { checked: true } })
 tree = react.createElement(Overlay, {})
 check('hiding preference persisted', JSON.parse(storage.get(core.STORAGE_KEY)).settings.hideMeaning === true)
+
+// --- Opacity slider -------------------------------------------------------
+// The slider drives a CSS variable on the sheet rather than an inline opacity,
+// so text stays fully opaque while only the surfaces fade.
+/** The opacity range input in the currently rendered tree. */
+function opacityInput(node) {
+  const row = elementsOf(node).filter(element => hasClass(element, 'el-field'))[4]
+  return elementsOf(row).find(element => element.type === 'input' && element.props.type === 'range')
+}
+
+const opacitySlider = opacityInput(tree)
+check('opacity slider is present', opacitySlider !== undefined)
+eq('opacity slider starts fully opaque', opacitySlider?.props.value, '100')
+eq('opacity slider floor keeps text legible', opacitySlider?.props.min, '30')
+opacitySlider.props.onChange({ target: { value: '55' } })
+tree = react.createElement(Overlay, {})
+eq('opacity persisted as a fraction', JSON.parse(storage.get(core.STORAGE_KEY)).settings.opacity, 0.55)
+const fadedSheet = elementsOf(tree).find(element => hasClass(element, 'el-sheet'))
+eq('opacity reaches the sheet as a CSS variable', fadedSheet?.props.style?.['--el-alpha'], '0.55')
+check('opacity is not applied to the whole sheet',
+  fadedSheet?.props.style?.opacity === undefined, String(fadedSheet?.props.style?.opacity))
+
+// The floor is enforced for anything below it, so a low value cannot make the
+// panel unreadable.
+opacityInput(tree).props.onChange({ target: { value: '10' } })
+eq('opacity cannot go below the floor', JSON.parse(storage.get(core.STORAGE_KEY)).settings.opacity, 0.3)
+
+// A zero (a corrupted profile, since the slider cannot produce one) falls back
+// to fully opaque rather than to the floor: an invisible panel would be
+// unrecoverable without clearing storage.
+eq('zero opacity falls back to opaque', core.normalizeOpacity(0), 1)
+eq('non-numeric opacity falls back to opaque', core.normalizeOpacity('nonsense'), 1)
+eq('opacity above one is clamped', core.normalizeOpacity(4), 1)
+
+// Restore full opacity for the visual checks that follow.
+tree = react.createElement(Overlay, {})
+opacityInput(tree).props.onChange({ target: { value: '100' } })
+tree = react.createElement(Overlay, {})
 
 fire(tree, 'el-tab', 'onClick', '学习')
 tree = react.createElement(Overlay, {})

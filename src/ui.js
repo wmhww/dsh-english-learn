@@ -29,6 +29,7 @@ var MESSAGES = {
     'tab.review': '复习',
     'tab.stats': '进度',
     'action.close': '关闭',
+    'panel.dragHint': '拖动标题栏可移动面板，双击回到居中',
     'action.back': '返回',
     'action.speak': '朗读',
     'action.next': '下一个',
@@ -101,6 +102,7 @@ var MESSAGES = {
     'settings.autoSpeak': '自动朗读单词',
     'settings.accent': '发音口音',
     'settings.hideMeaning': '卡片先隐藏释义',
+    'settings.opacity': '面板透明度',
   },
   en: {
     'app.title': 'English Learning',
@@ -112,6 +114,7 @@ var MESSAGES = {
     'tab.review': 'Review',
     'tab.stats': 'Progress',
     'action.close': 'Close',
+    'panel.dragHint': 'Drag the title bar to move the panel; double-click to re-centre',
     'action.back': 'Back',
     'action.speak': 'Speak',
     'action.next': 'Next',
@@ -184,6 +187,7 @@ var MESSAGES = {
     'settings.autoSpeak': 'Speak words automatically',
     'settings.accent': 'Accent',
     'settings.hideMeaning': 'Hide the meaning first',
+    'settings.opacity': 'Panel opacity',
   },
 }
 
@@ -364,6 +368,24 @@ function speak(text, accent) {
  * Store
  * ------------------------------------------------------------------ */
 
+/**
+ * Free space kept between the panel and every viewport edge, in CSS pixels.
+ *
+ * The sheet is centred and then offset by a transform, so the largest legal
+ * offset is `(viewport - sheet) / 2 - PANEL_EDGE_GAP`. That pins all four edges
+ * inside the viewport with a constant margin. An earlier clamp only guaranteed a
+ * partial overlap, which still let corners hang off-screen on a small window.
+ *
+ * The same number is published to CSS as `--el-gap`, and the sheet's width and
+ * height are capped at `viewport - 2 * gap`, so a drag can never be clamped to a
+ * position where the panel does not fit in the first place.
+ */
+var PANEL_EDGE_GAP = 8
+
+/** Preferred sheet size, before the viewport guards shrink it. */
+var PANEL_WIDTH = 700
+var PANEL_HEIGHT = 500
+
 /** The whole UI state; replaced wholesale on every mutation. */
 var appState = {
   open: false,
@@ -377,11 +399,14 @@ var appState = {
   quiz: null,
   /** Whether the library list shows every word or only the first screenful. */
   showAll: false,
+  /** Panel drag offset from centre; live during a drag, persisted on release. */
+  panelOffset: { x: 0, y: 0 },
   /** Transient message shown at the foot of the panel. */
   toast: null,
 }
 
 appState.tab = (appState.profile.ui && appState.profile.ui.tab) || 'learn'
+appState.panelOffset = panelOffset()
 
 var listeners = new Set()
 
@@ -426,6 +451,63 @@ function rememberUi(tab) {
   profile.ui = Object.assign({}, profile.ui, { tab: tab })
   writeStorage(profile)
 }
+
+/* ------------------------------------------------------------------ *
+ * Panel dragging
+ * ------------------------------------------------------------------ */
+
+/**
+ * Offset of the panel from its default centred position, in CSS pixels.
+ *
+ * Stored as a *delta* rather than an absolute position so the panel stays
+ * centred when the window is resized or when the sheet shrinks at a breakpoint —
+ * an absolute left/top would leave it stranded off-centre after a resize.
+ */
+function panelOffset() {
+  var saved = appState.profile.ui && appState.profile.ui.panelOffset
+  if (saved === undefined || saved === null) return { x: 0, y: 0 }
+  var x = Number(saved.x)
+  var y = Number(saved.y)
+  return { x: Number.isFinite(x) ? x : 0, y: Number.isFinite(y) ? y : 0 }
+}
+
+/** Persist the drag offset. Called once per drag, not per pointer move. */
+function savePanelOffset(offset) {
+  var profile = appState.profile
+  profile.ui = Object.assign({}, profile.ui, { panelOffset: { x: offset.x, y: offset.y } })
+  writeStorage(profile)
+}
+
+/** Reset the panel to its centred default. */
+function resetPanelOffset() {
+  var profile = appState.profile
+  profile.ui = Object.assign({}, profile.ui, { panelOffset: { x: 0, y: 0 } })
+  writeStorage(profile)
+  setState({ panelOffset: { x: 0, y: 0 } })
+}
+
+/**
+ * Clamp an offset so every edge of the sheet stays inside the viewport.
+ *
+ * The offset is a delta from centre, so the bound is the slack between the
+ * viewport and the sheet on each axis, minus {@link PANEL_EDGE_GAP}. When the
+ * sheet is as large as the viewport allows, the slack collapses to zero and the
+ * panel simply stops moving on that axis.
+ *
+ * @param {{x: number, y: number}} offset - the requested offset.
+ * @param {number} width - the sheet's rendered width.
+ * @param {number} height - the sheet's rendered height.
+ * @returns {{x: number, y: number}} the clamped offset.
+ */
+function clampPanelOffset(offset, width, height) {
+  var maxX = Math.max(0, (window.innerWidth - width) / 2 - PANEL_EDGE_GAP)
+  var maxY = Math.max(0, (window.innerHeight - height) / 2 - PANEL_EDGE_GAP)
+  return {
+    x: Math.max(-maxX, Math.min(maxX, offset.x)),
+    y: Math.max(-maxY, Math.min(maxY, offset.y)),
+  }
+}
+
 
 /* ------------------------------------------------------------------ *
  * Learner actions
@@ -600,97 +682,154 @@ function startQuizSession(count) {
  * ------------------------------------------------------------------ */
 
 var CSS = [
-  '.el-root{--el-radius:12px;color:var(--dsw-alias-label-primary);font-size:14px;line-height:1.6;}',
+  // Panel geometry lives here so the whole surface can be resized in one place.
+  // The defaults keep the sheet to roughly a study card: 700x500 is about half
+  // of a 1280x840 window, which is small enough to feel like a panel rather than
+  // an app, but still fits a word, its meaning and a grade row without scrolling.
+  //
+  // The variables are declared on BOTH `.el-overlay` and `.el-root` on purpose:
+  // `.el-root` sits *inside* `.el-sheet`, and custom properties only inherit
+  // downwards, so a declaration on `.el-root` alone would never reach the sheet
+  // that reads `--el-sheet-w`. `.el-overlay` covers the sheet and header, and
+  // `.el-root` covers the settings page, which has no overlay ancestor.
+  '.el-overlay,.el-root{--el-radius:12px;--el-gap:8px;--el-alpha:1;--el-sheet-w:700px;--el-sheet-h:500px;--el-card-pad:18px 20px;--el-word:30px;--el-meaning:18px;}',
+  '.el-root{color:var(--dsw-alias-label-primary);font-size:14px;line-height:1.6;}',
   '.el-root *{box-sizing:border-box;}',
-  '.el-inline{padding:4px 0 32px;}',
-  // The shell's overlay layer is click-through by design, so this surface has
-  // to opt back into pointer events or the backdrop would swallow every click.
-  '.el-overlay{position:fixed;inset:0;z-index:9999;display:flex;align-items:center;justify-content:center;background:rgba(6,10,18,.62);padding:24px;pointer-events:auto;}',
-  '.el-sheet{width:min(1080px,96vw);height:min(860px,90vh);display:flex;flex-direction:column;background:var(--dsw-alias-bg-base);border:1px solid var(--dsw-alias-border-l2);border-radius:18px;overflow:hidden;box-shadow:0 28px 90px rgba(0,0,0,.5);}',
-  '.el-head{display:flex;align-items:center;gap:12px;padding:12px 18px;border-bottom:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-1);flex:none;}',
-  '.el-title{font-size:15px;font-weight:650;letter-spacing:.01em;}',
-  '.el-sub{font-size:12px;color:var(--dsw-alias-label-secondary);}',
+  // The overlay mode makes `.el-root` a flex column that fills the sheet, so the
+  // tab strip keeps its natural height and `.el-body` gets the remainder and
+  // scrolls inside it. `min-height:0` is required: a flex item's automatic
+  // minimum is its content size, which would let the body grow past the sheet
+  // and be clipped by `overflow:hidden` instead of scrolling.
+  '.el-fill{flex:1;min-height:0;display:flex;flex-direction:column;}',
+  '.el-inline{padding:4px 0 24px;}',
+  // The shell's overlay layer is click-through by design, and this surface now
+  // stays that way: the panel is non-modal so the learner can keep chatting with
+  // the agent beside it. The backdrop therefore paints nothing and captures no
+  // pointer events — only the sheet itself opts back in.
+  '.el-overlay{position:fixed;inset:0;z-index:9999;display:flex;align-items:center;justify-content:center;padding:var(--el-gap);pointer-events:none;}',
+  // The viewport guards subtract both copies of the gap, so the sheet is never
+  // larger than the range the drag clamp allows it to move within.
+  //
+  // `--el-alpha` carries the opacity preference. It is applied to the surfaces
+  // only — sheet, header, cards, rows — while every text colour stays fully
+  // opaque, so a see-through panel is still readable. `--el-alpha` defaults to 1
+  // and is overwritten on the sheet element from the stored setting.
+  '.el-sheet{width:min(var(--el-sheet-w),100vw - 2*var(--el-gap));height:min(var(--el-sheet-h),100vh - 2*var(--el-gap));display:flex;flex-direction:column;background:color-mix(in srgb,var(--dsw-alias-bg-base) calc(var(--el-alpha) * 100%),transparent);border:1px solid var(--dsw-alias-border-l2);border-radius:14px;overflow:hidden;box-shadow:0 24px 70px rgba(0,0,0,.5);pointer-events:auto;}',
+  // Dragging: the sheet is offset from its centred position with a transform,
+  // which keeps layout untouched and stays GPU-composited. `will-change` is set
+  // only while dragging so idle panels do not hold a layer.
+  '.el-sheet.dragging{transition:none;will-change:transform;user-select:none;}',
+  '.el-sheet.settling{transition:transform .16s ease-out;}',
+  '.el-head{cursor:grab;touch-action:none;display:flex;align-items:center;gap:10px;padding:9px 14px;border-bottom:1px solid var(--dsw-alias-border-l1);background:color-mix(in srgb,var(--dsw-alias-bg-layer-1) calc(var(--el-alpha) * 100%),transparent);flex:none;}',
+  '.el-head.dragging{cursor:grabbing;}',
+  // Controls inside the header must not start a drag when clicked.
+  '.el-head button,.el-head a,.el-head input{cursor:pointer;}',
+  '.el-grip{color:var(--dsw-alias-label-secondary);font-size:13px;letter-spacing:-2px;opacity:.55;flex:none;user-select:none;}',
+  '.el-head:hover .el-grip{opacity:.9;}',
+  '.el-title{font-size:14px;font-weight:650;letter-spacing:.01em;}',
+  '.el-sub{font-size:11.5px;color:var(--dsw-alias-label-secondary);}',
   '.el-spacer{flex:1;}',
-  '.el-iconbtn{border:1px solid var(--dsw-alias-border-l1);background:transparent;color:var(--dsw-alias-label-secondary);border-radius:9px;padding:5px 11px;cursor:pointer;font-size:13px;line-height:1.4;}',
+  '.el-iconbtn{border:1px solid var(--dsw-alias-border-l1);background:transparent;color:var(--dsw-alias-label-secondary);border-radius:8px;padding:4px 10px;cursor:pointer;font-size:12.5px;line-height:1.4;}',
   '.el-iconbtn:hover{color:var(--dsw-alias-label-primary);border-color:var(--dsw-alias-border-l2);}',
-  '.el-tabs{display:flex;gap:4px;padding:10px 18px 0;border-bottom:1px solid var(--dsw-alias-border-l1);flex:none;flex-wrap:wrap;}',
-  '.el-tab{border:none;background:transparent;color:var(--dsw-alias-label-secondary);padding:8px 14px;border-radius:10px 10px 0 0;cursor:pointer;font-size:13.5px;border-bottom:2px solid transparent;}',
+  '.el-tabs{display:flex;gap:2px;padding:8px 14px 0;border-bottom:1px solid var(--dsw-alias-border-l1);flex:none;flex-wrap:wrap;}',
+  '.el-tab{border:none;background:transparent;color:var(--dsw-alias-label-secondary);padding:6px 12px;border-radius:8px 8px 0 0;cursor:pointer;font-size:13px;border-bottom:2px solid transparent;}',
   '.el-tab:hover{color:var(--dsw-alias-label-primary);}',
   '.el-tab.on{color:var(--dsw-alias-brand-primary);border-bottom-color:var(--dsw-alias-brand-primary);font-weight:600;}',
-  '.el-body{flex:1;overflow:auto;padding:22px 24px 40px;}',
-  '.el-btn{border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);border-radius:10px;padding:8px 15px;cursor:pointer;font-size:13.5px;}',
+  // The body is the only scroll container in the panel. It needs its own
+  // `min-height:0` as a flex child, and `overscroll-behavior` stops a scroll
+  // that reaches the end from chaining out to the page behind the panel.
+  '.el-body{flex:1;min-height:0;overflow-y:auto;overflow-x:hidden;overscroll-behavior:contain;padding:16px 18px 28px;}',
+  // A visible scrollbar: with the panel now translucent, an invisible scrollbar
+  // makes the content look truncated rather than scrollable.
+  '.el-body::-webkit-scrollbar{width:10px;}',
+  '.el-body::-webkit-scrollbar-thumb{background:var(--dsw-alias-border-l2);border-radius:99px;border:3px solid transparent;background-clip:content-box;}',
+  '.el-body::-webkit-scrollbar-thumb:hover{background:var(--dsw-alias-label-secondary);background-clip:content-box;}',
+  '.el-body::-webkit-scrollbar-track{background:transparent;}',
+  '.el-body{scrollbar-width:thin;scrollbar-color:var(--dsw-alias-border-l2) transparent;}',
+  '.el-btn{border:1px solid var(--dsw-alias-border-l1);background:color-mix(in srgb,var(--dsw-alias-bg-layer-1) calc(var(--el-alpha) * 100%),transparent);color:var(--dsw-alias-label-primary);border-radius:9px;padding:7px 13px;cursor:pointer;font-size:13px;}',
   '.el-btn:hover{border-color:var(--dsw-alias-border-l2);}',
   '.el-btn:disabled{opacity:.45;cursor:default;}',
   '.el-btn.primary{background:var(--dsw-alias-brand-primary);border-color:var(--dsw-alias-brand-primary);color:#fff;font-weight:600;}',
   '.el-btn.ghost{background:transparent;}',
-  '.el-btn.sm{padding:5px 11px;font-size:12.5px;border-radius:8px;}',
-  '.el-bar{height:6px;border-radius:99px;background:var(--dsw-alias-bg-layer-2);overflow:hidden;}',
+  '.el-btn.sm{padding:4px 10px;font-size:12px;border-radius:7px;}',
+  '.el-bar{height:5px;border-radius:99px;background:color-mix(in srgb,var(--dsw-alias-bg-layer-2) calc(var(--el-alpha) * 100%),transparent);overflow:hidden;}',
   '.el-bar>i{display:block;height:100%;background:var(--dsw-alias-brand-primary);border-radius:99px;transition:width .25s;}',
-  '.el-card{border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-1);border-radius:16px;padding:26px 28px;}',
-  '.el-cardhead{display:flex;align-items:center;gap:10px;margin-bottom:6px;flex-wrap:wrap;}',
-  '.el-word{font-size:38px;font-weight:680;letter-spacing:-.015em;line-height:1.15;}',
-  '.el-ipa{font-family:"Segoe UI",system-ui,sans-serif;font-size:17px;color:var(--dsw-alias-brand-primary);}',
-  '.el-pos{font-size:12px;color:var(--dsw-alias-label-secondary);border:1px solid var(--dsw-alias-border-l1);border-radius:6px;padding:1px 7px;}',
-  '.el-badge{font-size:11.5px;border-radius:99px;padding:2px 9px;border:1px solid var(--dsw-alias-border-l1);color:var(--dsw-alias-label-secondary);}',
+  '.el-card{border:1px solid var(--dsw-alias-border-l1);background:color-mix(in srgb,var(--dsw-alias-bg-layer-1) calc(var(--el-alpha) * 100%),transparent);border-radius:13px;padding:var(--el-card-pad);}',
+  '.el-cardhead{display:flex;align-items:center;gap:9px;margin-bottom:4px;flex-wrap:wrap;}',
+  '.el-word{font-size:var(--el-word);font-weight:680;letter-spacing:-.015em;line-height:1.15;}',
+  '.el-ipa{font-family:"Segoe UI",system-ui,sans-serif;font-size:15px;color:var(--dsw-alias-brand-primary);}',
+  '.el-pos{font-size:11.5px;color:var(--dsw-alias-label-secondary);border:1px solid var(--dsw-alias-border-l1);border-radius:6px;padding:1px 6px;}',
+  '.el-badge{font-size:11px;border-radius:99px;padding:1px 8px;border:1px solid var(--dsw-alias-border-l1);color:var(--dsw-alias-label-secondary);}',
   '.el-badge.new{border-color:var(--dsw-alias-state-success-primary);color:var(--dsw-alias-state-success-primary);}',
   '.el-badge.due{border-color:var(--dsw-alias-state-warn-primary);color:var(--dsw-alias-state-warn-primary);}',
-  '.el-meaning{font-size:22px;font-weight:600;margin:14px 0 4px;}',
-  '.el-sect{margin-top:20px;padding-top:16px;border-top:1px dashed var(--dsw-alias-border-l1);}',
-  '.el-sect>h4{margin:0 0 10px;font-size:12.5px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--dsw-alias-label-secondary);}',
-  '.el-ph{display:flex;gap:10px;align-items:baseline;padding:5px 0;font-size:14px;}',
+  '.el-meaning{font-size:var(--el-meaning);font-weight:600;margin:10px 0 2px;}',
+  '.el-sect{margin-top:14px;padding-top:12px;border-top:1px dashed var(--dsw-alias-border-l1);}',
+  '.el-sect>h4{margin:0 0 8px;font-size:11.5px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--dsw-alias-label-secondary);}',
+  '.el-ph{display:flex;gap:9px;align-items:baseline;padding:3px 0;font-size:13.5px;}',
   '.el-ph>b{font-weight:600;color:var(--dsw-alias-label-primary);}',
-  '.el-ph>span{color:var(--dsw-alias-label-secondary);font-size:13px;}',
-  '.el-ex{padding:8px 0;font-size:14.5px;}',
+  '.el-ph>span{color:var(--dsw-alias-label-secondary);font-size:12.5px;}',
+  '.el-ex{padding:6px 0;font-size:14px;}',
   '.el-ex>p{margin:0;}',
   '.el-ex>p+ p{margin-top:2px;}',
-  '.el-ex .cn{color:var(--dsw-alias-label-secondary);font-size:13.5px;}',
+  '.el-ex .cn{color:var(--dsw-alias-label-secondary);font-size:13px;}',
   '.el-ex .en{cursor:pointer;}',
   '.el-ex .en:hover{color:var(--dsw-alias-brand-primary);}',
-  '.el-actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:22px;align-items:center;}',
-  '.el-grades{display:grid;grid-template-columns:repeat(auto-fit,minmax(128px,1fr));gap:10px;margin-top:20px;}',
-  '.el-grade{border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-1);border-radius:11px;padding:11px 8px;cursor:pointer;display:flex;flex-direction:column;gap:3px;align-items:center;}',
+  '.el-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:16px;align-items:center;}',
+  '.el-grades{display:grid;grid-template-columns:repeat(auto-fit,minmax(104px,1fr));gap:8px;margin-top:14px;}',
+  '.el-grade{border:1px solid var(--dsw-alias-border-l1);background:color-mix(in srgb,var(--dsw-alias-bg-layer-1) calc(var(--el-alpha) * 100%),transparent);border-radius:9px;padding:8px 6px;cursor:pointer;display:flex;flex-direction:column;gap:2px;align-items:center;}',
   '.el-grade:hover{border-color:var(--dsw-alias-brand-primary);}',
-  '.el-grade>b{font-size:14px;font-weight:620;}',
-  '.el-grade>span{font-size:11.5px;color:var(--dsw-alias-label-secondary);}',
+  '.el-grade>b{font-size:13px;font-weight:620;}',
+  '.el-grade>span{font-size:11px;color:var(--dsw-alias-label-secondary);}',
   '.el-grade.again:hover{border-color:var(--dsw-alias-state-error-primary);}',
   '.el-grade.easy:hover{border-color:var(--dsw-alias-state-success-primary);}',
   '.el-hidden{filter:blur(9px);user-select:none;cursor:pointer;}',
-  '.el-input{width:100%;border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary);border-radius:11px;padding:14px 16px;font-size:24px;letter-spacing:.06em;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;outline:none;}',
+  '.el-input{width:100%;border:1px solid var(--dsw-alias-border-l1);background:color-mix(in srgb,var(--dsw-alias-bg-layer-2) calc(var(--el-alpha) * 100%),transparent);color:var(--dsw-alias-label-primary);border-radius:9px;padding:10px 13px;font-size:20px;letter-spacing:.06em;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;outline:none;}',
   '.el-input:focus{border-color:var(--dsw-alias-brand-primary);}',
-  '.el-mask{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:26px;letter-spacing:.22em;color:var(--dsw-alias-label-secondary);}',
-  '.el-marks{display:flex;flex-wrap:wrap;gap:2px;margin-top:14px;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:24px;}',
-  '.el-marks span{border-radius:6px;padding:2px 6px;}',
+  '.el-mask{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:22px;letter-spacing:.22em;color:var(--dsw-alias-label-secondary);}',
+  '.el-marks{display:flex;flex-wrap:wrap;gap:2px;margin-top:10px;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:20px;}',
+  '.el-marks span{border-radius:5px;padding:1px 5px;}',
   '.el-marks .ok{background:color-mix(in srgb,var(--dsw-alias-state-success-primary) 22%,transparent);color:var(--dsw-alias-state-success-primary);}',
   '.el-marks .no{background:color-mix(in srgb,var(--dsw-alias-state-error-primary) 22%,transparent);color:var(--dsw-alias-state-error-primary);text-decoration:line-through;}',
-  '.el-opt{display:block;width:100%;text-align:left;border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);border-radius:11px;padding:13px 16px;margin-top:10px;cursor:pointer;font-size:15px;}',
+  '.el-opt{display:block;width:100%;text-align:left;border:1px solid var(--dsw-alias-border-l1);background:color-mix(in srgb,var(--dsw-alias-bg-layer-1) calc(var(--el-alpha) * 100%),transparent);color:var(--dsw-alias-label-primary);border-radius:9px;padding:10px 13px;margin-top:8px;cursor:pointer;font-size:14px;}',
   '.el-opt:hover:not(:disabled){border-color:var(--dsw-alias-brand-primary);}',
   '.el-opt.right{border-color:var(--dsw-alias-state-success-primary);background:color-mix(in srgb,var(--dsw-alias-state-success-primary) 14%,transparent);}',
   '.el-opt.wrong{border-color:var(--dsw-alias-state-error-primary);background:color-mix(in srgb,var(--dsw-alias-state-error-primary) 14%,transparent);}',
-  '.el-note{color:var(--dsw-alias-label-secondary);font-size:13px;}',
+  '.el-note{color:var(--dsw-alias-label-secondary);font-size:12.5px;}',
   '.el-good{color:var(--dsw-alias-state-success-primary);font-weight:600;}',
   '.el-bad{color:var(--dsw-alias-state-error-primary);font-weight:600;}',
-  '.el-stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;margin-bottom:22px;}',
-  '.el-stat{border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-1);border-radius:13px;padding:14px 16px;}',
-  '.el-stat>span{display:block;font-size:12px;color:var(--dsw-alias-label-secondary);}',
-  '.el-stat>b{display:block;font-size:25px;font-weight:680;margin-top:3px;}',
-  '.el-row{display:flex;align-items:center;gap:14px;padding:11px 0;border-bottom:1px solid var(--dsw-alias-border-l1);}',
+  '.el-stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(112px,1fr));gap:9px;margin-bottom:16px;}',
+  '.el-stat{border:1px solid var(--dsw-alias-border-l1);background:color-mix(in srgb,var(--dsw-alias-bg-layer-1) calc(var(--el-alpha) * 100%),transparent);border-radius:11px;padding:10px 12px;}',
+  '.el-stat>span{display:block;font-size:11.5px;color:var(--dsw-alias-label-secondary);}',
+  '.el-stat>b{display:block;font-size:20px;font-weight:680;margin-top:2px;}',
+  '.el-row{display:flex;align-items:center;gap:11px;padding:8px 0;border-bottom:1px solid var(--dsw-alias-border-l1);}',
   '.el-row:last-child{border-bottom:none;}',
   '.el-row .grow{flex:1;min-width:0;}',
-  '.el-list{border:1px solid var(--dsw-alias-border-l1);border-radius:14px;background:var(--dsw-alias-bg-layer-1);padding:6px 16px;margin-top:18px;}',
-  '.el-toast{position:absolute;left:50%;bottom:18px;transform:translateX(-50%);background:var(--dsw-alias-bg-overlay);border:1px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-label-primary);border-radius:10px;padding:9px 16px;font-size:13px;box-shadow:0 10px 30px rgba(0,0,0,.28);}',
-  '.el-center{text-align:center;padding:44px 20px;}',
-  '.el-center>h3{margin:0 0 8px;font-size:19px;}',
-  '.el-tag{display:inline-block;font-size:11.5px;color:var(--dsw-alias-label-secondary);border:1px solid var(--dsw-alias-border-l1);border-radius:6px;padding:0 6px;margin-left:6px;}',
-  '.el-star{cursor:pointer;background:none;border:none;font-size:16px;line-height:1;padding:2px 4px;color:var(--dsw-alias-label-secondary);}',
+  '.el-list{border:1px solid var(--dsw-alias-border-l1);border-radius:11px;background:color-mix(in srgb,var(--dsw-alias-bg-layer-1) calc(var(--el-alpha) * 100%),transparent);padding:4px 13px;margin-top:13px;}',
+  // The toast is deliberately NOT faded with the rest: it is a transient
+  // notification that floats above the panel, and a half-transparent notice over
+  // an already-transparent panel would be unreadable.
+  '.el-toast{position:absolute;left:50%;bottom:14px;transform:translateX(-50%);background:var(--dsw-alias-bg-overlay);border:1px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-label-primary);border-radius:9px;padding:7px 13px;font-size:12.5px;box-shadow:0 10px 30px rgba(0,0,0,.28);}',
+  '.el-center{text-align:center;padding:32px 16px;}',
+  '.el-center>h3{margin:0 0 6px;font-size:17px;}',
+  '.el-tag{display:inline-block;font-size:11px;color:var(--dsw-alias-label-secondary);border:1px solid var(--dsw-alias-border-l1);border-radius:5px;padding:0 5px;margin-left:5px;}',
+  '.el-star{cursor:pointer;background:none;border:none;font-size:15px;line-height:1;padding:2px 4px;color:var(--dsw-alias-label-secondary);}',
   '.el-star.on{color:#e8b339;}',
-  '.el-progressline{height:4px;border-radius:99px;background:var(--dsw-alias-bg-layer-2);overflow:hidden;margin-bottom:18px;}',
+  '.el-progressline{height:4px;border-radius:99px;background:color-mix(in srgb,var(--dsw-alias-bg-layer-2) calc(var(--el-alpha) * 100%),transparent);overflow:hidden;margin-bottom:13px;}',
   '.el-progressline>i{display:block;height:100%;background:var(--dsw-alias-brand-primary);transition:width .25s;}',
-  '.el-speak{border:1px solid var(--dsw-alias-border-l1);background:transparent;border-radius:9px;width:34px;height:34px;display:inline-flex;align-items:center;justify-content:center;cursor:pointer;color:var(--dsw-alias-brand-primary);font-size:15px;flex:none;}',
+  '.el-speak{border:1px solid var(--dsw-alias-border-l1);background:transparent;border-radius:8px;width:29px;height:29px;display:inline-flex;align-items:center;justify-content:center;cursor:pointer;color:var(--dsw-alias-brand-primary);font-size:13px;flex:none;}',
   '.el-speak:hover{border-color:var(--dsw-alias-brand-primary);}',
-  '.el-field{display:flex;align-items:center;gap:12px;padding:9px 0;}',
-  '.el-field>label{flex:1;font-size:13.5px;}',
-  '.el-field select,.el-field input[type=number]{border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary);border-radius:8px;padding:5px 9px;font-size:13px;}',
+  '.el-field{display:flex;align-items:center;gap:10px;padding:7px 0;}',
+  '.el-field>label{flex:1;font-size:13px;}',
+  '.el-field select,.el-field input[type=number]{border:1px solid var(--dsw-alias-border-l1);background:color-mix(in srgb,var(--dsw-alias-bg-layer-2) calc(var(--el-alpha) * 100%),transparent);color:var(--dsw-alias-label-primary);border-radius:8px;padding:5px 9px;font-size:13px;}',
+  '.el-field input[type=range]{width:130px;accent-color:var(--dsw-alias-brand-primary);}',
   '.el-flex{display:flex;gap:10px;align-items:center;flex-wrap:wrap;}',
+  // Narrow windows: the size guards above already shrink the sheet to the
+  // viewport minus the edge gap, so only the type scale needs adjusting here.
+  // These selectors match `.el-overlay` too, for the same inheritance reason.
+  '@media (max-width:980px){.el-overlay,.el-root{--el-word:28px;--el-meaning:17px;--el-card-pad:16px 16px;}}',
+  // Very narrow: the grade buttons would shrink below a usable tap target, so
+  // drop to two per row instead of four across.
+  '@media (max-width:640px){.el-overlay,.el-root{--el-gap:6px;--el-word:25px;}.el-sheet{border-radius:10px;}.el-grades{grid-template-columns:repeat(2,1fr);}.el-body{padding:12px 12px 22px;}.el-tabs{padding:6px 10px 0;}.el-head{padding:7px 10px;}.el-stat>b{font-size:17px;}}',
 ].join('\n')
 
 /** Insert the stylesheet once and hand back its disposer. */
@@ -1358,6 +1497,21 @@ function StatsTab(props) {
         h('input', {
           type: 'checkbox', checked: profile.settings.hideMeaning === true,
           onChange: function onChange(event) { setSetting('hideMeaning', event.target.checked) },
+        })),
+      // Opacity is a range so the panel can be faded while keeping the chat
+      // behind it visible. The label shows the live value, because a bare slider
+      // gives no feedback about how transparent the panel actually is.
+      h('div', { className: 'el-field' },
+        h('label', { htmlFor: 'el-opacity' },
+          tr('settings.opacity') + ' \u00B7 ' + Math.round(normalizeOpacity(profile.settings.opacity) * 100) + '%'),
+        h('input', {
+          id: 'el-opacity',
+          type: 'range',
+          min: String(Math.round(MIN_OPACITY * 100)),
+          max: '100',
+          step: '1',
+          value: String(Math.round(normalizeOpacity(profile.settings.opacity) * 100)),
+          onChange: function onChange(event) { setSetting('opacity', normalizeOpacity(Number(event.target.value) / 100)) },
         }))),
     h('div', { className: 'el-actions' },
       h('button', {
@@ -1387,7 +1541,12 @@ function AppBody(props) {
   else if (active === 'review') surface = h(ReviewTab, null)
   else surface = h(StatsTab, null)
 
-  return h('div', { className: 'el-root ' + (props.mode === 'overlay' ? '' : 'el-inline') },
+  // `el-fill` is what makes the body scrollable: without it `.el-root` is a
+  // plain block, so `.el-body`'s `flex:1` has nothing to resolve against and the
+  // body grows past the sheet, where `overflow:hidden` clips it.
+  return h('div', {
+    className: 'el-root ' + (props.mode === 'overlay' ? 'el-fill' : 'el-inline'),
+  },
     h('div', { className: 'el-tabs' },
       TABS.map(function tabButton(tab) {
         return h('button', {
@@ -1409,17 +1568,116 @@ function AppBody(props) {
   )
 }
 
-/** Full-screen overlay mounted into `shell.overlay`. */
+/**
+ * Full-screen overlay mounted into `shell.overlay`.
+ *
+ * The panel is draggable by its header. Pointer events are used rather than
+ * mouse events so a pen or a touch drag works the same way, and the listeners
+ * live on `window` for the duration of a drag so the panel keeps following the
+ * pointer even when it passes over the iframe-free but fast-moving backdrop.
+ */
 function OverlayPanel(props) {
   var state = useAppState()
+  var sheetRef = react.useRef(null)
+  var dragRef = react.useRef(null)
+  var [dragging, setDragging] = react.useState(false)
+  var [settling, setSettling] = react.useState(false)
+
   if (!state.open) return null
+
+  var offset = state.panelOffset || { x: 0, y: 0 }
+
+  /** Current rendered size of the sheet, used for clamping. */
+  function sheetSize() {
+    var node = sheetRef.current
+    if (node === null || node === undefined || node.offsetWidth === 0) {
+      return { width: PANEL_WIDTH, height: PANEL_HEIGHT }
+    }
+    return { width: node.offsetWidth, height: node.offsetHeight }
+  }
+
+  function onPointerDown(event) {
+    // Left button / primary touch only; ignore right-click and middle-click.
+    if (event.button !== undefined && event.button !== 0) return
+    // A click on a control inside the header must not start a drag.
+    var target = event.target
+    while (target !== null && target !== undefined && target !== event.currentTarget) {
+      var tag = String(target.tagName || '').toLowerCase()
+      if (tag === 'button' || tag === 'a' || tag === 'input' || tag === 'select') return
+      target = target.parentNode
+    }
+    dragRef.current = {
+      startX: event.clientX,
+      startY: event.clientY,
+      originX: offset.x,
+      originY: offset.y,
+      moved: false,
+    }
+    setDragging(true)
+    setSettling(false)
+
+    function onMove(moveEvent) {
+      var drag = dragRef.current
+      if (drag === null) return
+      var dx = moveEvent.clientX - drag.startX
+      var dy = moveEvent.clientY - drag.startY
+      if (!drag.moved && Math.abs(dx) + Math.abs(dy) > 3) drag.moved = true
+      var size = sheetSize()
+      var next = clampPanelOffset({ x: drag.originX + dx, y: drag.originY + dy }, size.width, size.height)
+      setState({ panelOffset: next })
+    }
+
+    function onUp() {
+      var drag = dragRef.current
+      dragRef.current = null
+      setDragging(false)
+      window.removeEventListener('pointermove', onMove)
+      window.removeEventListener('pointerup', onUp)
+      window.removeEventListener('pointercancel', onUp)
+      // Persist once per drag rather than on every pointer move.
+      if (drag !== null && drag.moved) {
+        savePanelOffset(appState.panelOffset)
+        setSettling(true)
+      }
+    }
+
+    window.addEventListener('pointermove', onMove)
+    window.addEventListener('pointerup', onUp)
+    window.addEventListener('pointercancel', onUp)
+  }
+
+  /** Double-clicking the header recentres the panel. */
+  function onDoubleClick() {
+    resetPanelOffset()
+    setSettling(true)
+  }
+
+  var sheetClass = 'el-sheet' + (dragging ? ' dragging' : '') + (settling && !dragging ? ' settling' : '')
+  var alpha = normalizeOpacity(state.profile.settings.opacity)
+
+  // No click-to-dismiss on the backdrop: the panel is non-modal, so a click
+  // beside it belongs to the chat underneath. Closing is explicit — the header
+  // button, or the sidebar toggle.
   return h('div', {
     className: 'el-overlay',
     role: 'dialog',
     'aria-label': tr('app.title'),
-    onClick: function onBackdrop(event) { if (event.target === event.currentTarget) setState({ open: false }) },
-  }, h('div', { className: 'el-sheet' },
-    h('div', { className: 'el-head' },
+    'aria-modal': 'false',
+  }, h('div', {
+    ref: sheetRef,
+    className: sheetClass,
+    style: {
+      transform: 'translate(' + offset.x + 'px, ' + offset.y + 'px)',
+      '--el-alpha': String(alpha),
+    },
+  },
+    h('div', {
+      className: 'el-head' + (dragging ? ' dragging' : ''),
+      onPointerDown: onPointerDown,
+      onDoubleClick: onDoubleClick,
+      title: tr('panel.dragHint'),
+    },
+      h('span', { className: 'el-grip', 'aria-hidden': 'true' }, '\u22EE\u22EE'),
       h('div', null,
         h('div', { className: 'el-title' }, '\uD83D\uDCD8 ' + tr('app.title')),
         h('div', { className: 'el-sub' }, tr('app.subtitle'))),

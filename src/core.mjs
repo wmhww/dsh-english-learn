@@ -360,6 +360,15 @@ export function defaultSettings() {
     accent: 'en-GB',
     /** Hide Chinese meanings until the card is flipped. */
     hideMeaning: false,
+    /**
+     * Opacity of the panel's surfaces, 0.3-1.
+     *
+     * Only the panel's own background is faded; text keeps full opacity, so a
+     * translucent panel stays readable while the chat behind it shows through.
+     * 1 means fully opaque, which is the default because an opaque panel is the
+     * safest starting point and translucency is a deliberate opt-in.
+     */
+    opacity: 1,
   }
 }
 
@@ -378,6 +387,25 @@ export function defaultState() {
   }
 }
 
+/** Lowest opacity the panel accepts; below this the text stops being legible. */
+export const MIN_OPACITY = 0.3
+
+/**
+ * Coerce a stored opacity into the supported range.
+ *
+ * A hand-edited or corrupted profile could carry `0`, `null` or a string; `0`
+ * would make the panel invisible with no way back except clearing storage, so
+ * anything unusable falls back to fully opaque rather than to the minimum.
+ * @param {unknown} value - candidate opacity.
+ * @returns {number} a number in [MIN_OPACITY, 1].
+ */
+export function normalizeOpacity(value) {
+  const number = Number(value)
+  if (!Number.isFinite(number)) return 1
+  if (number <= 0) return 1
+  return Math.min(1, Math.max(MIN_OPACITY, number))
+}
+
 /**
  * Merge a stored profile over the defaults so a profile written by an older
  * version keeps working.
@@ -390,6 +418,7 @@ export function hydrate(stored) {
   const value = /** @type {Record<string, any>} */ (stored)
   const merged = Object.assign(base, value)
   merged.settings = Object.assign(defaultSettings(), value.settings ?? {})
+  merged.settings.opacity = normalizeOpacity(merged.settings.opacity)
   if (merged.progress === null || typeof merged.progress !== 'object') merged.progress = {}
   if (merged.starred === null || typeof merged.starred !== 'object') merged.starred = {}
   if (!Array.isArray(merged.log)) merged.log = []

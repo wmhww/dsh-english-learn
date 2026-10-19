@@ -70,10 +70,10 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/OWNER/dsh-english-learn.git"
+    "url": "git+https://github.com/wmhww/dsh-english-learn.git"
   },
   "bugs": {
-    "url": "https://github.com/OWNER/dsh-english-learn/issues"
+    "url": "https://github.com/wmhww/dsh-english-learn/issues"
   },
-  "homepage": "https://github.com/OWNER/dsh-english-learn#readme"
+  "homepage": "https://github.com/wmhww/dsh-english-learn#readme"
 }
