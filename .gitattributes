@@ -1,0 +1,14 @@
+# Normalise line endings so the repo behaves the same on Windows and Unix.
+# Without this, git rewrites every file to CRLF on checkout and the whole tree
+# shows as modified after a clone on Windows.
+* text=auto eol=lf
+
+# Generated decks: keep them LF and mark them as generated so GitHub collapses
+# them in diffs and code review does not try to read 1.9 MB of JSON.
+src/data/*.json text eol=lf linguist-generated=true
+
+# Binary-ish artefacts that must never be line-ending converted.
+*.png binary
+*.jpg binary
+*.ico binary
+*.tgz binary

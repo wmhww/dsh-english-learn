@@ -1,0 +1,178 @@
+/**
+ * Build dsh-english-learn.
+ *
+ * Produces the two halves DSH loads:
+ *   lib/index.js   — the Host half (a plain Cordis plugin).
+ *   lib/client.js  — the browser half, wrapped in the shell's module-loader
+ *                    format so `require("react")` resolves against the shell's
+ *                    static registry.
+ *
+ * The browser bundle is a concatenation, not a bundler run: core.mjs and ui.js
+ * are inlined in one factory scope, and the vocabulary JSON is injected as a
+ * literal. That keeps the plugin dependency-free and reproducible offline.
+ */
+import { mkdir, readFile, writeFile, readdir } from 'node:fs/promises'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+const here = dirname(fileURLToPath(import.meta.url))
+const root = join(here, '..')
+const dataDir = join(root, 'src', 'data')
+const outDir = join(root, 'lib')
+
+/** Package name; also the module id the shell registers the bundle under. */
+const PACKAGE = 'dsh-english-learn'
+
+/** Drop ESM `export` keywords so the core can be inlined into a function scope. */
+function stripExports(source) {
+  return source.replace(/^export\s+(?=(?:async\s+)?(?:function|const|let|var|class)\b)/gm, '')
+}
+
+/**
+ * Deck size bounds.
+ *
+ * A deck is a whole exam word list (CET-4 is ~4,200 words), not a 20-word
+ * teaching set — the 20-word grouping happens at study time in the UI. These
+ * bounds only catch a deck that is obviously truncated or duplicated.
+ */
+const MIN_WORDS = 20
+const MAX_WORDS = 20000
+
+/** Reject a malformed deck loudly at build time rather than in the browser. */
+function validateGroup(group, file) {
+  const where = `src/data/${file}`
+  if (typeof group.id !== 'string' || group.id === '') throw new Error(`${where}: missing id`)
+  if (typeof group.title !== 'string' || group.title === '') throw new Error(`${where}: missing title`)
+  if (!Array.isArray(group.words)) throw new Error(`${where}: words must be an array`)
+  if (group.words.length < MIN_WORDS || group.words.length > MAX_WORDS) {
+    throw new Error(`${where}: expected ${MIN_WORDS}-${MAX_WORDS} words, found ${group.words.length}`)
+  }
+  const seen = new Set()
+  for (const word of group.words) {
+    for (const field of ['w', 'ipa', 'pos', 'cn']) {
+      if (typeof word[field] !== 'string' || word[field] === '') {
+        throw new Error(`${where}: word ${JSON.stringify(word.w)} is missing ${field}`)
+      }
+    }
+    if (!/^\/.*\/$/.test(word.ipa)) {
+      throw new Error(`${where}: ${word.w} has a malformed ipa ${JSON.stringify(word.ipa)}`)
+    }
+    // Collocations and examples are best-effort enrichment: a word may have
+    // none. What must hold is that whatever is present is well formed.
+    if (!Array.isArray(word.phrases)) {
+      throw new Error(`${where}: ${word.w} phrases must be an array`)
+    }
+    if (!Array.isArray(word.examples)) {
+      throw new Error(`${where}: ${word.w} examples must be an array`)
+    }
+    for (const phrase of word.phrases) {
+      if (typeof phrase.en !== 'string' || typeof phrase.cn !== 'string') {
+        throw new Error(`${where}: ${word.w} has a malformed phrase`)
+      }
+    }
+    for (const example of word.examples) {
+      if (typeof example.en !== 'string' || typeof example.cn !== 'string') {
+        throw new Error(`${where}: ${word.w} has a malformed example`)
+      }
+    }
+    const key = word.w.trim().toLowerCase()
+    if (seen.has(key)) throw new Error(`${where}: duplicate headword ${word.w}`)
+    seen.add(key)
+  }
+  return group
+}
+
+/** Cross-group duplicate check: one headword may belong to only one group. */
+function checkCrossGroupDuplicates(groups) {
+  const owner = new Map()
+  for (const group of groups) {
+    for (const word of group.words) {
+      const key = word.w.trim().toLowerCase()
+      const previous = owner.get(key)
+      if (previous !== undefined && previous !== group.id) {
+        throw new Error(`headword "${word.w}" appears in both "${previous}" and "${group.id}"`)
+      }
+      owner.set(key, group.id)
+    }
+  }
+}
+
+/** Read and validate every group file, in a stable order. */
+async function loadGroups() {
+  const files = (await readdir(dataDir)).filter(name => name.endsWith('.json')).sort()
+  if (files.length === 0) throw new Error('no group files found in src/data')
+  const groups = []
+  for (const file of files) {
+    const text = await readFile(join(dataDir, file), 'utf8')
+    let parsed
+    try {
+      parsed = JSON.parse(text)
+    } catch (error) {
+      throw new Error(`src/data/${file}: invalid JSON — ${error.message}`)
+    }
+    groups.push(validateGroup(parsed, file))
+  }
+  checkCrossGroupDuplicates(groups)
+  return groups
+}
+
+/** Emit the browser bundle. */
+async function buildClient(groups) {
+  const core = stripExports(await readFile(join(root, 'src', 'core.mjs'), 'utf8'))
+  const ui = await readFile(join(root, 'src', 'ui.js'), 'utf8')
+  const payload = JSON.stringify(groups)
+
+  const banner = [
+    '// dsh-english-learn client bundle — generated by scripts/build.mjs.',
+    '// Do not edit by hand; edit src/ and rebuild.',
+    `// ${groups.length} groups, ${groups.length * 20} words.`,
+    '',
+    'window.__ModuleLoader__.load({',
+    `  id: ${JSON.stringify(PACKAGE)},`,
+    '  factory: (require) => {',
+    '    var module = { exports: {} };',
+    '    var exports = module.exports;',
+    '    Object.defineProperty(exports, Symbol.toStringTag, { value: "Module" });',
+    '    var react = require("react");',
+    '',
+    `    var GROUPS = ${payload};`,
+    '',
+  ].join('\n')
+
+  const body = [
+    '    /* ==================== src/core.mjs ==================== */',
+    core,
+    '',
+    '    /* ==================== src/ui.js ==================== */',
+    ui,
+  ].join('\n')
+
+  // The banner opens the factory body; these two closers shut the factory
+  // function and then the loader's spec object plus its call.
+  const output = banner + body + '\n  },\n})\n'
+  await writeFile(join(outDir, 'client.js'), output, 'utf8')
+  return output.length
+}
+
+/** Copy the Host half through, since it needs no transformation. */
+async function buildHost() {
+  const source = await readFile(join(root, 'src', 'index.mjs'), 'utf8')
+  await writeFile(join(outDir, 'index.js'), source, 'utf8')
+}
+
+async function main() {
+  await mkdir(outDir, { recursive: true })
+  const groups = await loadGroups()
+  const size = await buildClient(groups)
+  await buildHost()
+  const words = groups.reduce((total, group) => total + group.words.length, 0)
+  console.log(`built lib/client.js (${(size / 1024).toFixed(1)} kB) — ${groups.length} groups, ${words} words`)
+  for (const group of groups) {
+    console.log(`  ${group.id.padEnd(16)} ${String(group.words.length).padStart(3)} words  ${group.title}`)
+  }
+}
+
+main().catch(error => {
+  console.error('build failed:', error.message)
+  process.exitCode = 1
+})

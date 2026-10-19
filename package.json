@@ -1,0 +1,79 @@
+{
+  "name": "dsh-english-learn",
+  "version": "1.0.0",
+  "description": "英语学习 — CET-4/CET-6 vocabulary trainer for DeepSeek Harness (dsh): 5,371 syllabus words studied 20 at a time, with IPA, Chinese glosses, collocations, example sentences, spelling practice and SM-2 spaced repetition. Fully offline.",
+  "keywords": [
+    "deepseek",
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "english",
+    "vocabulary",
+    "cet4",
+    "cet6",
+    "四六级",
+    "flashcards",
+    "spaced-repetition",
+    "spelling",
+    "ipa",
+    "offline"
+  ],
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./client": {
+      "default": "./lib/client.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "engines": {
+      "dsh": ">=0.1.7-rc.1"
+    },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-connection",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-ui-primitives",
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-api-remotes"
+      ]
+    }
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "verify": "node scripts/verify.mjs",
+    "audit": "node scripts/audit.mjs",
+    "data": "node --max-old-space-size=6144 scripts/pipeline.mjs",
+    "data:import": "node scripts/import-data.mjs",
+    "check": "node --check lib/index.js && node --check lib/client.js",
+    "prepublishOnly": "npm run build && npm run verify"
+  },
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "files": [
+    "lib/index.js",
+    "lib/client.js",
+    "cordis.patch.yml",
+    "README.md",
+    "NOTICE.md"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/OWNER/dsh-english-learn.git"
+  },
+  "bugs": {
+    "url": "https://github.com/OWNER/dsh-english-learn/issues"
+  },
+  "homepage": "https://github.com/OWNER/dsh-english-learn#readme"
+}
